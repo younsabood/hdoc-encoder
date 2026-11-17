@@ -1,0 +1,46 @@
+[package]
+name = "hdoc-encoder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+description = "Create HyperDoc (HDOC) files from page display lists and binary assets"
+repository = "https://github.com/younsabood/hdoc-encoder"
+readme = "README.md"
+keywords = ["hyperdoc", "document", "zstd", "encoder"]
+categories = ["encoding", "compression"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "docs/**",
+]
+
+[features]
+default = []
+pdf-ingest = ["dep:base64", "dep:hayro-svg", "dep:image", "dep:pdf-extract", "dep:ravif", "dep:svag", "dep:svgtypes"]
+
+[dependencies]
+blake3 = "1.8"
+crc32fast = "1.5"
+thiserror = "2.0"
+zstd = "0.14"
+base64 = { version = "0.22", optional = true }
+hayro-svg = { version = "0.9", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+pdf-extract = { version = "0.12.1", optional = true }
+ravif = { version = "0.13", optional = true }
+svag = { version = "0.1.2", optional = true }
+svgtypes = { version = "0.16.1", optional = true }
+
+[[example]]
+name = "pdf_to_hdoc"
+required-features = ["pdf-ingest"]

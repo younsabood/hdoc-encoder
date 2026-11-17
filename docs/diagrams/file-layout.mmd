@@ -1,0 +1,6 @@
+flowchart TB
+    Header["32-byte HDOC header"] --> Assets["Asset payloads"]
+    Assets --> Chunks["Independent Zstandard page chunks"]
+    Chunks --> Search["Optional compressed search block"]
+    Search --> Index["Compressed HDIX central index"]
+    Index --> Trailer["16-byte end marker"]

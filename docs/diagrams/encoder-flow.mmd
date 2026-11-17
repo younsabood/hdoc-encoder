@@ -1,0 +1,16 @@
+flowchart LR
+    Input["Display lists / PDF"] --> Pages["Page commands + Unicode text"]
+    Input --> Assets["Images / vector assets"]
+    Input --> Import["Optional PDF ingest"]
+    Import --> Pages
+    Import --> Assets
+    Assets --> Hash["BLAKE3 deduplicate"]
+    Assets --> HPTH["HPTH path bytecode"]
+    HPTH --> Dict["Shared Zstandard dictionary"]
+    Pages --> Opcodes["Page opcodes"]
+    Opcodes --> Chunks["Independent solid chunks"]
+    Hash --> Payloads["Asset payloads"]
+    Dict --> Payloads
+    Chunks --> Index["Search block + central index"]
+    Payloads --> Index
+    Index --> File["HDOC v1"]

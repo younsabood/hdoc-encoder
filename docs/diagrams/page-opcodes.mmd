@@ -1,0 +1,12 @@
+flowchart LR
+    Start["PageDisplayList"] --> State["Font / color state"]
+    State --> Position["Absolute or delta position"]
+    Position --> Draw{"Drawing command"}
+    Draw --> Glyph["Shaped glyph run"]
+    Draw --> Image["Image asset"]
+    Draw --> Vector["Vector asset / SVG"]
+    Draw --> Template["SVG template + HPTH references"]
+    Glyph --> End["END_PAGE 0x08"]
+    Image --> End
+    Vector --> End
+    Template --> End
