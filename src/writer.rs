@@ -1,4 +1,7 @@
-use std::io::Write;
+use std::{
+    io::{Cursor, Seek, SeekFrom, Write},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     asset_pool::StoredAsset,
@@ -9,7 +12,7 @@ use crate::{
     },
     opcodes::encode_page,
     search::SearchBlock,
-    EncoderError,
+    EncoderError, HdocError, PageDisplayList,
 };
 
 const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
@@ -21,6 +24,9 @@ const VECTOR_PATH_ZSTD_DICTIONARY_MEDIA_TYPE: &str =
 const VECTOR_DICTIONARY_MEDIA_TYPE: &str = "application/vnd.hyperdoc.vector-dictionary;version=1";
 const VECTOR_DICTIONARY_MAX_SIZE: usize = 8 * 1024;
 const VECTOR_DICTIONARY_COMPRESSION_LEVEL: i32 = 19;
+
+type IndexedPageResult = (usize, Result<Vec<u8>, HdocError>);
+type IndexedChunkResult = (usize, Result<Vec<u8>, std::io::Error>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodingStats {
@@ -49,21 +55,45 @@ struct PreparedAsset {
     hash: [u8; 32],
 }
 
+#[derive(Debug)]
+struct ChunkPlan {
+    chunk_id: u32,
+    first_page: u32,
+    raw: Vec<u8>,
+    local_records: Vec<PageRecord>,
+}
+
 pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, EncoderError> {
+    let mut cursor = Cursor::new(Vec::new());
+    let stats = encode_to_seekable(builder, &mut cursor)?;
+    Ok(EncodingOutput {
+        bytes: cursor.into_inner(),
+        stats,
+    })
+}
+
+pub(crate) fn encode_to_seekable<W: Write + Seek>(
+    builder: &HdocEncoderBuilder,
+    writer: &mut W,
+) -> Result<EncodingStats, EncoderError> {
     if builder.pages.is_empty() {
         return Err(EncoderError::EmptyDocument);
     }
     let prepared_assets = prepare_assets(builder.assets.entries())?;
-    let mut output = vec![0u8; HEADER_SIZE];
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(&[0u8; HEADER_SIZE])?;
+    let mut current_offset = HEADER_SIZE as u64;
     let mut assets = Vec::with_capacity(prepared_assets.len());
     let mut input_payload_bytes = 0u64;
 
     for item in &prepared_assets {
-        let offset = u64::try_from(output.len())
-            .map_err(|_| EncoderError::InvalidOption("file exceeds supported size"))?;
+        let offset = current_offset;
         let length = u64::try_from(item.bytes.len())
             .map_err(|_| EncoderError::InvalidOption("asset is too large"))?;
-        output.extend_from_slice(&item.bytes);
+        writer.write_all(&item.bytes)?;
+        current_offset = current_offset
+            .checked_add(length)
+            .ok_or(EncoderError::InvalidOption("file exceeds supported size"))?;
         input_payload_bytes = input_payload_bytes.saturating_add(length);
         assets.push(AssetRecord {
             id: item.id,
@@ -76,15 +106,13 @@ pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, Enc
         });
     }
 
-    let encoded_pages = builder
-        .pages
-        .iter()
-        .map(encode_page)
-        .collect::<Result<Vec<_>, _>>()?;
+    let encoded_pages = encode_pages_parallel(&builder.pages)?;
     for page in &encoded_pages {
         input_payload_bytes = input_payload_bytes.saturating_add(page.len() as u64);
     }
-    let (chunks, page_directory) = write_chunks(builder, &encoded_pages, &mut output)?;
+    let (chunks, page_directory) =
+        write_chunks_streaming(builder, &encoded_pages, writer, &mut current_offset)?;
+
     let search_block = if builder.include_search_index {
         let raw_search = SearchBlock::from_page_texts(builder.page_texts.clone()).encode()?;
         if raw_search.len() > MAX_SEARCH_BLOCK_BYTES {
@@ -93,13 +121,15 @@ pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, Enc
             ));
         }
         let compressed = zstd::bulk::compress(&raw_search, builder.profile.zstd_level())?;
-        let offset = u64::try_from(output.len())
-            .map_err(|_| EncoderError::InvalidOption("file exceeds supported size"))?;
+        let offset = current_offset;
         let compressed_size = u32::try_from(compressed.len())
             .map_err(|_| EncoderError::InvalidOption("search block exceeds 4 GiB"))?;
         let uncompressed_size = u32::try_from(raw_search.len())
             .map_err(|_| EncoderError::InvalidOption("search block exceeds 4 GiB"))?;
-        output.extend_from_slice(&compressed);
+        writer.write_all(&compressed)?;
+        current_offset = current_offset
+            .checked_add(u64::from(compressed_size))
+            .ok_or(EncoderError::InvalidOption("file exceeds supported size"))?;
         SearchBlockRecord {
             offset,
             compressed_size,
@@ -108,6 +138,7 @@ pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, Enc
     } else {
         SearchBlockRecord::default()
     };
+
     let mut metadata = builder.metadata.clone();
     metadata.insert("format_version".into(), "1.0".into());
     metadata.insert(
@@ -128,12 +159,15 @@ pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, Enc
         ));
     }
     let compressed_index = zstd::bulk::compress(&raw_index, builder.profile.zstd_level())?;
-    let footer_offset = u64::try_from(output.len())
-        .map_err(|_| EncoderError::InvalidOption("file exceeds supported size"))?;
+    let footer_offset = current_offset;
     let footer_size = u32::try_from(compressed_index.len())
         .map_err(|_| EncoderError::InvalidOption("central index exceeds 4 GiB"))?;
-    output.extend_from_slice(&compressed_index);
-    output.extend_from_slice(&END_MARKER);
+    writer.write_all(&compressed_index)?;
+    writer.write_all(&END_MARKER)?;
+    let output_bytes = footer_offset
+        .checked_add(u64::from(footer_size))
+        .and_then(|end| end.checked_add(END_MARKER.len() as u64))
+        .ok_or(EncoderError::InvalidOption("file exceeds supported size"))?;
 
     let asset_count = u32::try_from(prepared_assets.len())
         .map_err(|_| EncoderError::InvalidOption("too many assets"))?;
@@ -151,21 +185,57 @@ pub(crate) fn encode(builder: &HdocEncoderBuilder) -> Result<EncodingOutput, Enc
     if builder.profile.is_archival() {
         header.flags |= FLAG_ARCHIVAL;
     }
-    output[..HEADER_SIZE].copy_from_slice(&header.encode());
 
-    let stats = EncodingStats {
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(&header.encode())?;
+    writer.seek(SeekFrom::End(0))?;
+    writer.flush()?;
+
+    Ok(EncodingStats {
         page_count: header.page_count,
         unique_asset_count: header.asset_count,
         duplicate_asset_count: builder.assets.duplicate_count(),
         input_payload_bytes,
-        output_bytes: output.len() as u64,
+        output_bytes,
         chunk_count: u32::try_from(index.chunks.len())
             .map_err(|_| EncoderError::InvalidOption("too many chunks"))?,
-    };
-    Ok(EncodingOutput {
-        bytes: output,
-        stats,
     })
+}
+
+fn encode_pages_parallel(pages: &[PageDisplayList]) -> Result<Vec<Vec<u8>>, HdocError> {
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(pages.len())
+        .max(1);
+    if worker_count == 1 || pages.len() < 8 {
+        return pages.iter().map(encode_page).collect();
+    }
+
+    let next_index = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<IndexedPageResult>> =
+        std::sync::Mutex::new(Vec::with_capacity(pages.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let index = next_index.fetch_add(1, Ordering::Relaxed);
+                if index >= pages.len() {
+                    break;
+                }
+                let encoded = encode_page(&pages[index]);
+                if let Ok(mut guard) = results.lock() {
+                    guard.push((index, encoded));
+                }
+            });
+        }
+    });
+
+    let mut collected = results
+        .into_inner()
+        .map_err(|_| HdocError::InvalidFormat("page encoder worker poisoned".into()))?;
+    collected.sort_unstable_by_key(|(index, _)| *index);
+    collected.into_iter().map(|(_, res)| res).collect()
 }
 
 fn prepare_assets(entries: &[StoredAsset]) -> Result<Vec<PreparedAsset>, EncoderError> {
@@ -251,17 +321,18 @@ fn prepare_assets(entries: &[StoredAsset]) -> Result<Vec<PreparedAsset>, Encoder
     Ok(prepared)
 }
 
-fn write_chunks(
+fn write_chunks_streaming<W: Write>(
     builder: &HdocEncoderBuilder,
     pages: &[Vec<u8>],
-    output: &mut Vec<u8>,
+    writer: &mut W,
+    current_offset: &mut u64,
 ) -> Result<(Vec<ChunkRecord>, Vec<PageRecord>), EncoderError> {
-    let mut chunks = Vec::new();
-    let mut directory = Vec::with_capacity(pages.len());
+    let mut plans = Vec::<ChunkPlan>::new();
     let mut page_index = 0usize;
     while page_index < pages.len() {
-        let first_page = page_index;
-        let chunk_id = u32::try_from(chunks.len())
+        let first_page =
+            u32::try_from(page_index).map_err(|_| EncoderError::InvalidOption("too many pages"))?;
+        let chunk_id = u32::try_from(plans.len())
             .map_err(|_| EncoderError::InvalidOption("too many chunks"))?;
         let mut raw = Vec::new();
         let mut local_records = Vec::new();
@@ -290,24 +361,83 @@ fn write_chunks(
             });
             page_index += 1;
         }
-        let compressed = zstd::bulk::compress(&raw, builder.profile.zstd_level())?;
-        let chunk_offset = u64::try_from(output.len())
-            .map_err(|_| EncoderError::InvalidOption("file exceeds supported size"))?;
-        let compressed_size = u32::try_from(compressed.len())
-            .map_err(|_| EncoderError::InvalidOption("compressed chunk exceeds 4 GiB"))?;
-        let uncompressed_size = u32::try_from(raw.len())
-            .map_err(|_| EncoderError::InvalidOption("uncompressed chunk exceeds 4 GiB"))?;
-        output.write_all(&compressed)?;
-        chunks.push(ChunkRecord {
-            offset: chunk_offset,
-            compressed_size,
-            uncompressed_size,
-            first_page: u32::try_from(first_page)
-                .map_err(|_| EncoderError::InvalidOption("too many pages"))?,
-            page_count: u32::try_from(local_records.len())
-                .map_err(|_| EncoderError::InvalidOption("too many pages in chunk"))?,
+        plans.push(ChunkPlan {
+            chunk_id,
+            first_page,
+            raw,
+            local_records,
         });
-        directory.extend(local_records);
     }
+
+    let level = builder.profile.zstd_level();
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1);
+
+    let mut chunks = Vec::with_capacity(plans.len());
+    let mut directory = Vec::with_capacity(pages.len());
+
+    for batch in plans.chunks(worker_count) {
+        let compressed_batch = compress_chunk_batch_parallel(batch, level)?;
+        for (plan, compressed) in batch.iter().zip(compressed_batch) {
+            let _ = plan.chunk_id;
+            let chunk_offset = *current_offset;
+            let compressed_size = u32::try_from(compressed.len())
+                .map_err(|_| EncoderError::InvalidOption("compressed chunk exceeds 4 GiB"))?;
+            let uncompressed_size = u32::try_from(plan.raw.len())
+                .map_err(|_| EncoderError::InvalidOption("uncompressed chunk exceeds 4 GiB"))?;
+            writer.write_all(&compressed)?;
+            *current_offset = current_offset
+                .checked_add(u64::from(compressed_size))
+                .ok_or(EncoderError::InvalidOption("file exceeds supported size"))?;
+            chunks.push(ChunkRecord {
+                offset: chunk_offset,
+                compressed_size,
+                uncompressed_size,
+                first_page: plan.first_page,
+                page_count: u32::try_from(plan.local_records.len())
+                    .map_err(|_| EncoderError::InvalidOption("too many pages in chunk"))?,
+            });
+            directory.extend_from_slice(&plan.local_records);
+        }
+    }
+
     Ok((chunks, directory))
+}
+
+fn compress_chunk_batch_parallel(
+    batch: &[ChunkPlan],
+    level: i32,
+) -> Result<Vec<Vec<u8>>, EncoderError> {
+    if batch.len() <= 1 {
+        return batch
+            .iter()
+            .map(|plan| Ok(zstd::bulk::compress(&plan.raw, level)?))
+            .collect();
+    }
+    let next_index = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<IndexedChunkResult>> =
+        std::sync::Mutex::new(Vec::with_capacity(batch.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..batch.len() {
+            scope.spawn(|| loop {
+                let index = next_index.fetch_add(1, Ordering::Relaxed);
+                if index >= batch.len() {
+                    break;
+                }
+                let compressed = zstd::bulk::compress(&batch[index].raw, level);
+                if let Ok(mut guard) = results.lock() {
+                    guard.push((index, compressed));
+                }
+            });
+        }
+    });
+
+    let mut collected = results
+        .into_inner()
+        .map_err(|_| EncoderError::InvalidOption("chunk compressor worker poisoned"))?;
+    collected.sort_unstable_by_key(|(index, _)| *index);
+    collected.into_iter().map(|(_, res)| Ok(res?)).collect()
 }

@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufWriter, Seek, Write},
+};
 
 use crate::{asset_pool::AssetPool, AssetInput, CompressionProfile, EncoderError, PageDisplayList};
 
@@ -28,7 +32,7 @@ impl HdocEncoderBuilder {
             page_texts: Vec::new(),
             assets: AssetPool::default(),
             metadata: BTreeMap::new(),
-            profile: CompressionProfile::Archival,
+            profile: CompressionProfile::default(),
             max_pages_per_chunk: 64,
             target_chunk_bytes: 8 * 1024 * 1024,
             include_search_index: true,
@@ -126,21 +130,27 @@ impl HdocEncoderBuilder {
         crate::writer::encode(self)
     }
 
-    pub fn write_to<W: std::io::Write>(
-        &self,
-        mut writer: W,
-    ) -> Result<crate::EncodingStats, EncoderError> {
+    pub fn write_to<W: Write>(&self, mut writer: W) -> Result<crate::EncodingStats, EncoderError> {
         let output = self.encode()?;
         writer.write_all(&output.bytes)?;
         Ok(output.stats)
+    }
+
+    /// Stream assets, compressed chunks, search block, and central index directly
+    /// to a seekable output without buffering the entire HDOC file in memory.
+    pub fn write_to_seekable<W: Write + Seek>(
+        &self,
+        mut writer: W,
+    ) -> Result<crate::EncodingStats, EncoderError> {
+        crate::writer::encode_to_seekable(self, &mut writer)
     }
 
     pub fn write_to_path(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<crate::EncodingStats, EncoderError> {
-        let output = self.encode()?;
-        std::fs::write(path, &output.bytes)?;
-        Ok(output.stats)
+        let file = File::create(path)?;
+        let mut buffered = BufWriter::new(file);
+        crate::writer::encode_to_seekable(self, &mut buffered)
     }
 }

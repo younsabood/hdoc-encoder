@@ -18,7 +18,8 @@ and compression profile for one output file.
 | `include_search_index(enabled)` | Enable or omit the document text index. |
 | `encode()` | Return the complete output bytes and encoding statistics. |
 | `write_to(writer)` | Write to any `std::io::Write`. |
-| `write_to_path(path)` | Write the HDOC file to disk. |
+| `write_to_seekable(writer)` | Stream assets and compressed chunks directly to `Write + Seek`. |
+| `write_to_path(path)` | Stream the HDOC file directly to disk using buffered seekable I/O. |
 
 ## Page data
 
@@ -29,9 +30,11 @@ Use `draw_glyph_run` to validate that glyph IDs and offsets have equal lengths.
 
 ## Compression settings
 
-`CompressionProfile::Archival` uses Zstandard level 22. `Balanced` uses level 19,
-and `UltraLight` uses level 9. The default chunk target is 64 pages or 8 MiB of
-uncompressed page opcodes, whichever is reached first.
+`CompressionProfile::Archival` (the default) uses Zstandard level 22. `Balanced`
+uses level 19, and `UltraLight` uses level 9. The default chunk target is 64
+pages or 8 MiB of uncompressed page opcodes, whichever is reached first. Page
+bytecode serialization and chunk compression execute in parallel across
+available CPU threads.
 
 `EncodingStats` reports pages, unique and duplicate assets, input payload bytes,
 output bytes, and chunk count. See the [format guide](format.md) for details on

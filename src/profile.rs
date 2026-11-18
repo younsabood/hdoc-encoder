@@ -1,8 +1,8 @@
 /// Zstandard settings for the page-layout chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionProfile {
-    Archival,
     #[default]
+    Archival,
     Balanced,
     UltraLight,
 }

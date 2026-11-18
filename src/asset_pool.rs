@@ -56,6 +56,14 @@ impl AssetPool {
         let hash = *blake3::hash(&input.bytes).as_bytes();
         if let Some(id) = self.by_hash.get(&hash).copied() {
             self.duplicate_count += 1;
+            if let Some(existing) = self.entries.get_mut(id as usize) {
+                if existing.input.width == 0 && input.width > 0 {
+                    existing.input.width = input.width;
+                }
+                if existing.input.height == 0 && input.height > 0 {
+                    existing.input.height = input.height;
+                }
+            }
             return Ok(id);
         }
         let id = u32::try_from(self.entries.len())
@@ -67,11 +75,6 @@ impl AssetPool {
 
     pub fn entries(&self) -> &[StoredAsset] {
         &self.entries
-    }
-
-    #[cfg(feature = "pdf-ingest")]
-    pub fn contains_bytes(&self, bytes: &[u8]) -> bool {
-        self.by_hash.contains_key(blake3::hash(bytes).as_bytes())
     }
 
     pub fn duplicate_count(&self) -> u64 {

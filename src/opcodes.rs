@@ -1,5 +1,26 @@
 use crate::{varint, HdocError};
 
+pub const SAFE_SVG_PRESENTATION_ATTRIBUTES: &[&str] = &[
+    "clip-path",
+    "clip-rule",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "mask",
+    "opacity",
+    "paint-order",
+    "stroke",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
+    "style",
+    "vector-effect",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PageCommand {
     SetFont {
@@ -100,6 +121,123 @@ impl PageDisplayList {
     }
 }
 
+/// Validate that an SVG presentation attribute fragment contains only allowlisted
+/// attribute names, properly quoted values, and no markup/script injection payloads.
+pub fn validate_svg_presentation(presentation: &str) -> Result<(), HdocError> {
+    let bytes = presentation.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_lowercase() || bytes[cursor] == b'-')
+        {
+            cursor += 1;
+        }
+        if name_start == cursor || cursor >= bytes.len() || bytes[cursor] != b'=' {
+            return Err(HdocError::InvalidFormat(
+                "invalid SVG presentation attribute syntax".into(),
+            ));
+        }
+        let name = &presentation[name_start..cursor];
+        if SAFE_SVG_PRESENTATION_ATTRIBUTES
+            .binary_search(&name)
+            .is_err()
+        {
+            return Err(HdocError::InvalidFormat(
+                "disallowed SVG presentation attribute".into(),
+            ));
+        }
+        cursor += 1;
+        if cursor >= bytes.len() || bytes[cursor] != b'"' {
+            return Err(HdocError::InvalidFormat(
+                "SVG presentation attribute value must be double-quoted".into(),
+            ));
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] != b'"' {
+            if matches!(bytes[cursor], b'<' | b'>' | b'\0') {
+                return Err(HdocError::InvalidFormat(
+                    "unsafe character in SVG presentation attribute".into(),
+                ));
+            }
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            return Err(HdocError::InvalidFormat(
+                "unterminated SVG presentation attribute value".into(),
+            ));
+        }
+        if name == "style" {
+            let style_lower = presentation[value_start..cursor].to_ascii_lowercase();
+            if style_lower.contains("javascript:")
+                || style_lower.contains("expression(")
+                || style_lower.contains("@import")
+                || style_lower.contains("transform:")
+            {
+                return Err(HdocError::InvalidFormat(
+                    "unsafe CSS construct in SVG style attribute".into(),
+                ));
+            }
+        }
+        cursor += 1;
+        if cursor < bytes.len() && bytes[cursor] != b' ' {
+            return Err(HdocError::InvalidFormat(
+                "SVG presentation attributes must be space-separated".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects embedded scripts, foreign objects, or inline event handlers in SVG payloads.
+pub fn validate_svg_markup(svg: &str) -> Result<(), HdocError> {
+    let bytes = svg.as_bytes();
+    if contains_ascii_case_insensitive(bytes, b"<script")
+        || contains_ascii_case_insensitive(bytes, b"<foreignobject")
+        || contains_ascii_case_insensitive(bytes, b"javascript:")
+    {
+        return Err(HdocError::InvalidFormat(
+            "unsafe script or foreignObject in SVG payload".into(),
+        ));
+    }
+    let mut index = 0usize;
+    while index + 4 < bytes.len() {
+        if matches!(bytes[index], b' ' | b'\t' | b'\r' | b'\n')
+            && bytes[index + 1].eq_ignore_ascii_case(&b'o')
+            && bytes[index + 2].eq_ignore_ascii_case(&b'n')
+        {
+            let mut end = index + 3;
+            while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+                end += 1;
+            }
+            if end > index + 3 {
+                while end < bytes.len() && matches!(bytes[end], b' ' | b'\t' | b'\r' | b'\n') {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end] == b'=' {
+                    return Err(HdocError::InvalidFormat(
+                        "unsafe event handler attribute in SVG payload".into(),
+                    ));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Encode one page's commands and append its mandatory END_PAGE opcode.
 pub fn encode_page(page: &PageDisplayList) -> Result<Vec<u8>, HdocError> {
     let mut out = Vec::new();
@@ -174,6 +312,7 @@ pub fn encode_page(page: &PageDisplayList) -> Result<Vec<u8>, HdocError> {
                 }
             }
             PageCommand::DrawSvgFallback { svg } => {
+                validate_svg_markup(svg)?;
                 out.push(0x09);
                 varint::write_u32(
                     u32::try_from(svg.len()).map_err(|_| HdocError::LimitExceeded)?,
@@ -186,6 +325,7 @@ pub fn encode_page(page: &PageDisplayList) -> Result<Vec<u8>, HdocError> {
                 glyph_styles,
                 glyphs,
             } => {
+                validate_svg_markup(svg)?;
                 out.push(0x0a);
                 varint::write_u32(
                     u32::try_from(svg.len()).map_err(|_| HdocError::LimitExceeded)?,
@@ -205,6 +345,7 @@ pub fn encode_page(page: &PageDisplayList) -> Result<Vec<u8>, HdocError> {
                         }
                         out.extend_from_slice(&value.to_le_bytes());
                     }
+                    validate_svg_presentation(&style.presentation)?;
                     varint::write_u32(
                         u32::try_from(style.presentation.len())
                             .map_err(|_| HdocError::LimitExceeded)?,
@@ -319,12 +460,14 @@ pub fn decode_page(
                 let length = varint::read_u32(input, &mut cursor)? as usize;
                 let svg = String::from_utf8(take(input, &mut cursor, length)?.to_vec())
                     .map_err(|_| HdocError::InvalidUtf8)?;
+                validate_svg_markup(&svg)?;
                 page.push(PageCommand::DrawSvgFallback { svg });
             }
             0x0a => {
                 let svg_length = varint::read_u32(input, &mut cursor)? as usize;
                 let svg = String::from_utf8(take(input, &mut cursor, svg_length)?.to_vec())
                     .map_err(|_| HdocError::InvalidUtf8)?;
+                validate_svg_markup(&svg)?;
                 let style_count = varint::read_u32(input, &mut cursor)? as usize;
                 if style_count > input.len().saturating_sub(cursor) / 17 {
                     return Err(HdocError::Truncated);
@@ -348,6 +491,7 @@ pub fn decode_page(
                     let presentation =
                         String::from_utf8(take(input, &mut cursor, presentation_len)?.to_vec())
                             .map_err(|_| HdocError::InvalidUtf8)?;
+                    validate_svg_presentation(&presentation)?;
                     glyph_styles.push(SvgGlyphStyle {
                         matrix,
                         presentation,
@@ -372,8 +516,7 @@ pub fn decode_page(
                     }
                     glyphs.push(glyph);
                 }
-                let marker_count = svg.matches("<!--HDOC_GLYPH-->").count();
-                if marker_count != glyphs.len() {
+                if svg.matches("<!--HDOC_GLYPH-->").count() != glyphs.len() {
                     return Err(HdocError::InvalidFormat(
                         "SVG glyph template marker count does not match glyph table".into(),
                     ));
@@ -395,6 +538,7 @@ fn take<'a>(input: &'a [u8], cursor: &mut usize, count: usize) -> Result<&'a [u8
     *cursor = end;
     Ok(bytes)
 }
+
 fn read_u16(input: &[u8], cursor: &mut usize) -> Result<u16, HdocError> {
     Ok(u16::from_le_bytes(
         take(input, cursor, 2)?
@@ -402,6 +546,7 @@ fn read_u16(input: &[u8], cursor: &mut usize) -> Result<u16, HdocError> {
             .expect("fixed integer slice"),
     ))
 }
+
 fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, HdocError> {
     Ok(u32::from_le_bytes(
         take(input, cursor, 4)?
@@ -409,6 +554,7 @@ fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, HdocError> {
             .expect("fixed integer slice"),
     ))
 }
+
 fn read_i32(input: &[u8], cursor: &mut usize) -> Result<i32, HdocError> {
     Ok(i32::from_le_bytes(
         take(input, cursor, 4)?
@@ -420,8 +566,8 @@ fn read_i32(input: &[u8], cursor: &mut usize) -> Result<i32, HdocError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_page, encode_page, GlyphOffset, PageCommand, PageDisplayList, SvgGlyphStyle,
-        SvgGlyphUse,
+        decode_page, encode_page, validate_svg_markup, validate_svg_presentation, GlyphOffset,
+        PageCommand, PageDisplayList, SvgGlyphStyle, SvgGlyphUse,
     };
 
     #[test]
@@ -447,7 +593,7 @@ mod tests {
             svg: "<svg><!--HDOC_GLYPH--></svg>".into(),
             glyph_styles: vec![SvgGlyphStyle {
                 matrix: [0.012, 0.0, 0.0, -0.012],
-                presentation: "fill=\"#1895ad\"".into(),
+                presentation: "fill=\"#1895ad\" stroke-width=\"1.5\"".into(),
             }],
             glyphs: vec![SvgGlyphUse {
                 asset_id: 3,
@@ -463,5 +609,17 @@ mod tests {
         let (decoded, consumed) = decode_page(&encoded, 612, 792, 0).unwrap();
         assert_eq!(decoded, page);
         assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn rejects_unsafe_svg_attributes_and_scripts() {
+        assert!(validate_svg_presentation("").is_ok());
+        assert!(validate_svg_presentation("fill=\"#000\" opacity=\"0.5\"").is_ok());
+        assert!(validate_svg_presentation("onload=\"alert(1)\"").is_err());
+        assert!(validate_svg_presentation("fill=\"#000\"/><script>").is_err());
+        assert!(validate_svg_presentation("style=\"background:javascript:evil()\"").is_err());
+        assert!(validate_svg_markup("<svg><script>alert(1)</script></svg>").is_err());
+        assert!(validate_svg_markup("<svg onload=\"alert(1)\"/>").is_err());
+        assert!(validate_svg_markup("<svg><g opacity=\"1\"/></svg>").is_ok());
     }
 }

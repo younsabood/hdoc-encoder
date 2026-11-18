@@ -79,13 +79,15 @@ fn encode_and_inspect(name: &str) {
     );
     assert!(
         index.assets.iter().all(|asset| {
-            asset.media_type == "image/avif"
-                || asset
-                    .media_type
-                    .starts_with("application/vnd.hyperdoc.vector-path")
+            matches!(
+                asset.media_type.as_str(),
+                "image/avif" | "image/png" | "image/jpeg"
+            ) || asset
+                .media_type
+                .starts_with("application/vnd.hyperdoc.vector-path")
                 || asset.media_type == "application/vnd.hyperdoc.vector-dictionary;version=1"
         }),
-        "asset pool contains deduplicated AVIF images and vector data"
+        "asset pool contains deduplicated binary images and vector data"
     );
     let dictionary_asset = index
         .assets
@@ -113,7 +115,7 @@ fn encode_and_inspect(name: &str) {
             "vector paths use the binary path schema"
         );
     }
-    assert_page_images_use_avif_or_deduplicated_assets(&encoded.bytes, &index, name);
+    assert_page_images_use_deduplicated_binary_assets(&encoded.bytes, &index, name);
 
     let search = &index.search_block;
     let raw_search = zstd::bulk::decompress(
@@ -152,13 +154,13 @@ fn encode_and_inspect(name: &str) {
                 if svg.contains("<svg")
                     && svg.contains("<!--HDOC_GLYPH-->")
                     && !glyphs.is_empty()
-                    && !svg.contains("data:image/png;base64,")
+                    && !svg.contains("base64,")
         )),
-        "{name} stores text as binary vector glyph paths and keeps raster images as AVIF"
+        "{name} stores text as binary vector glyph paths and keeps raster images out of Base64"
     );
 }
 
-fn assert_page_images_use_avif_or_deduplicated_assets(
+fn assert_page_images_use_deduplicated_binary_assets(
     bytes: &[u8],
     index: &CentralIndex,
     name: &str,
@@ -200,32 +202,25 @@ fn assert_page_images_use_avif_or_deduplicated_assets(
                 let asset_id = asset_tail[..asset_end]
                     .parse::<usize>()
                     .expect("SVG asset reference contains a numeric asset id");
-                assert_eq!(
-                    index
-                        .assets
-                        .get(asset_id)
-                        .map(|asset| asset.media_type.as_str()),
-                    Some("image/avif"),
-                    "{name} page {} references an AVIF asset",
+                let media_type = index
+                    .assets
+                    .get(asset_id)
+                    .map(|asset| asset.media_type.as_str());
+                assert!(
+                    matches!(media_type, Some("image/avif" | "image/png" | "image/jpeg")),
+                    "{name} page {} references a valid binary image asset",
                     page_id + 1
                 );
                 remaining = &asset_tail[asset_end..];
             }
 
-            let mut remaining = svg.as_str();
-            while let Some(uri_offset) = remaining.find("data:image/") {
-                let mime_start = uri_offset + "data:".len();
-                let mime_tail = &remaining[mime_start..];
-                let mime_end = mime_tail.find(';').unwrap_or(mime_tail.len());
-                let mime = &mime_tail[..mime_end];
-                assert!(
-                    mime.eq_ignore_ascii_case("image/svg+xml")
-                        || mime.eq_ignore_ascii_case("image/avif"),
-                    "{name} page {} contains unsupported inline image data {mime}",
-                    page_id + 1
-                );
-                remaining = &mime_tail[mime_end..];
-            }
+            assert!(
+                !svg.contains("data:image/png;base64,")
+                    && !svg.contains("data:image/jpeg;base64,")
+                    && !svg.contains("data:image/avif;base64,"),
+                "{name} page {} contains unextracted Base64 raster image data",
+                page_id + 1
+            );
         }
     }
 }

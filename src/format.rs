@@ -265,9 +265,11 @@ fn put_string(output: &mut Vec<u8>, value: &str) -> Result<(), HdocError> {
 fn put_u16(output: &mut Vec<u8>, value: u16) {
     output.extend_from_slice(&value.to_le_bytes());
 }
+
 fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
+
 fn put_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -286,13 +288,16 @@ struct Cursor<'a> {
     input: &'a [u8],
     position: usize,
 }
+
 impl<'a> Cursor<'a> {
     fn new(input: &'a [u8]) -> Self {
         Self { input, position: 0 }
     }
+
     fn remaining(&self) -> usize {
         self.input.len().saturating_sub(self.position)
     }
+
     fn take(&mut self, length: usize) -> Result<&'a [u8], HdocError> {
         let end = self
             .position
@@ -305,21 +310,25 @@ impl<'a> Cursor<'a> {
         self.position = end;
         Ok(slice)
     }
+
     fn u16(&mut self) -> Result<u16, HdocError> {
         Ok(u16::from_le_bytes(
             self.take(2)?.try_into().expect("fixed integer slice"),
         ))
     }
+
     fn u32(&mut self) -> Result<u32, HdocError> {
         Ok(u32::from_le_bytes(
             self.take(4)?.try_into().expect("fixed integer slice"),
         ))
     }
+
     fn u64(&mut self) -> Result<u64, HdocError> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().expect("fixed integer slice"),
         ))
     }
+
     fn string(&mut self) -> Result<String, HdocError> {
         let length = self.u16()? as usize;
         String::from_utf8(self.take(length)?.to_vec()).map_err(|_| HdocError::InvalidUtf8)
